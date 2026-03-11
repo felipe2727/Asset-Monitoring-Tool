@@ -1,0 +1,16 @@
+.env
+*.db
+*.sqlite
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.idea/
+.vscode/
+*.egg-info/
+dist/
+build/
+.DS_Store
+sentinel/output/sent/
+logs/
