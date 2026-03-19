@@ -12,7 +12,7 @@ from typing import Optional
 import httpx
 import feedparser
 
-from sentinel.config import RSS_FEEDS, SOURCE_TIERS, get_active_assets
+from sentinel.config import RSS_FEEDS, SOURCE_TIERS, get_active_assets, get_match_keywords
 
 logger = logging.getLogger(__name__)
 
@@ -40,16 +40,14 @@ def _stable_url_id(url: str) -> str:
     return hashlib.md5(url.encode()).hexdigest()
 
 
-def _match_assets(text: str, asset_symbols: list[str], asset_names: list[str]) -> list[str]:
-    """Returns asset symbols mentioned in the text."""
+def _match_assets(text: str, assets) -> list[str]:
+    """Returns asset symbols mentioned in the text using keyword matching."""
     text_lower = text.lower()
     mentioned = []
-    for sym, name in zip(asset_symbols, asset_names):
-        if (f"${sym.lower()}" in text_lower
-                or f" {sym.lower()} " in text_lower
-                or f"({sym.lower()})" in text_lower
-                or name.lower()[:8] in text_lower):
-            mentioned.append(sym)
+    for asset in assets:
+        keywords = get_match_keywords(asset)
+        if any(kw in text_lower for kw in keywords):
+            mentioned.append(asset.symbol)
     return list(set(mentioned))
 
 
@@ -75,8 +73,6 @@ async def _fetch_feed(
         return []
 
     active_assets = get_active_assets()
-    symbols = [a.symbol for a in active_assets]
-    names = [a.name for a in active_assets]
 
     articles = []
     for entry in feed.entries[:30]:  # cap at 30 per feed
@@ -87,7 +83,7 @@ async def _fetch_feed(
             continue
 
         text = f"{title} {summary}"
-        mentioned = _match_assets(text, symbols, names)
+        mentioned = _match_assets(text, active_assets)
 
         articles.append({
             "source":        source,

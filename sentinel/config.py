@@ -66,6 +66,21 @@ FINNHUB_API_KEY: str = os.getenv("FINNHUB_API_KEY", "")
 REDDIT_CLIENT_ID: str = os.getenv("REDDIT_CLIENT_ID", "")
 REDDIT_CLIENT_SECRET: str = os.getenv("REDDIT_CLIENT_SECRET", "")
 REDDIT_USER_AGENT: str = os.getenv("REDDIT_USER_AGENT", "Sentinel/1.0")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scraper endpoint URLs
+# ─────────────────────────────────────────────────────────────────────────────
+ARCTICSHIFT_BASE: str = "https://arctic-shift.photon-reddit.com/api"
+SCRAPINGDOG_TWITTER_URL: str = "https://api.scrapingdog.com/twitter/"
+STOCKTWITS_BASE: str = "https://api.stocktwits.com/api/2"
+
+STOCKTWITS_SYMBOL_MAP: dict[str, str] = {
+    "BTC": "BTC.X", "ETH": "ETH.X", "SOL": "SOL.X", "AVAX": "AVAX.X",
+    "LINK": "LINK.X", "DOT": "DOT.X", "MATIC": "MATIC.X",
+    "ARB": "ARB.X", "OP": "OP.X", "NEAR": "NEAR.X",
+    "SUI": "SUI.X", "INJ": "INJ.X", "RENDER": "RNDR.X",
+    "FET": "FET.X", "APT": "APT.X",
+}
 ALPHA_VANTAGE_API_KEY: str = os.getenv("ALPHA_VANTAGE_API_KEY", "")
 FRED_API_KEY: str = os.getenv("FRED_API_KEY", "")
 SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
@@ -117,6 +132,10 @@ SOURCE_TIERS: dict[str, float] = {
     "tiingo":            0.6,
     "reddit":            0.3,
     "twitter":           0.2,
+    "oilprice.com":      0.6,
+    "kitco.com":         0.7,
+    "mining.com":        0.6,
+    "eia.gov":           0.8,
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,6 +151,44 @@ class Asset:
     peers: list[str] = field(default_factory=list)
     benchmark: str = "SPY"  # correlation benchmark
     coingecko_id: str = ""  # for crypto
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Asset keyword matching (for text mention detection)
+# ─────────────────────────────────────────────────────────────────────────────
+_ASSET_ALIASES: dict[str, list[str]] = {
+    # Commodities — match by underlying, not ETF name
+    "GLD":  ["gold"],
+    "SLV":  ["silver"],
+    "USO":  ["crude oil", "wti", "brent", "oil price"],
+    "UNG":  ["natural gas", "nat gas", "henry hub"],
+    "CPER": ["copper"],
+    # REITs
+    "VNQ":  ["real estate", "reit"],
+    "O":    ["realty income"],
+    # Crypto
+    "BTC":  ["bitcoin", "btc"],
+    "ETH":  ["ethereum", "eth"],
+    "SOL":  ["solana"],
+    "AVAX": ["avalanche"],
+}
+
+
+def get_match_keywords(asset: "Asset") -> list[str]:
+    """Returns lowercase keywords to detect this asset in free text."""
+    terms = [asset.symbol.lower(), asset.name.lower()]
+    if asset.sector:
+        terms.append(asset.sector.lower())
+    terms.extend(_ASSET_ALIASES.get(asset.symbol, []))
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    unique: list[str] = []
+    for t in terms:
+        if t not in seen:
+            seen.add(t)
+            unique.append(t)
+    return unique
+
 
 FULL_WATCHLIST: list[Asset] = [
     # ── Stocks ───────────────────────────────────────────────────────────────
@@ -172,11 +229,11 @@ FULL_WATCHLIST: list[Asset] = [
     Asset("FET",   "Fetch.ai",     "crypto", "public", "AI",                  ["RENDER"],     "BTC",  "fetch-ai"),
     Asset("APT",   "Aptos",        "crypto", "public", "Alt L1",              [],             "BTC",  "aptos"),
     # ── Commodities (ETF proxies) ─────────────────────────────────────────────
-    Asset("GLD",  "SPDR Gold",     "commodity","public","Gold",    [], "DXY"),
-    Asset("SLV",  "iShares Silver","commodity","public","Silver",  [], "DXY"),
-    Asset("USO",  "US Oil Fund",   "commodity","public","Crude Oil",[], "DXY"),
-    Asset("UNG",  "US Nat Gas",    "commodity","public","Nat Gas", [], "DXY"),
-    Asset("CPER", "US Copper",     "commodity","public","Copper",  [], "DXY"),
+    Asset("GLD",  "SPDR Gold",     "commodity","public","Gold",      ["SLV","CPER"], "DXY"),
+    Asset("SLV",  "iShares Silver","commodity","public","Silver",    ["GLD","CPER"], "DXY"),
+    Asset("USO",  "US Oil Fund",   "commodity","public","Crude Oil", ["UNG"],        "DXY"),
+    Asset("UNG",  "US Nat Gas",    "commodity","public","Nat Gas",   ["USO"],        "DXY"),
+    Asset("CPER", "US Copper",     "commodity","public","Copper",    ["GLD","SLV"],  "DXY"),
     # ── REITs ────────────────────────────────────────────────────────────────
     Asset("VNQ",  "Vanguard REIT", "reit","public","Broad REIT",      [], "^TNX"),
     Asset("O",    "Realty Income", "reit","public","Net Lease",        [], "^TNX"),
@@ -208,7 +265,7 @@ def get_active_assets() -> list[Asset]:
 # ─────────────────────────────────────────────────────────────────────────────
 RSS_FEEDS: list[dict] = [
     # Tier 1 — Major financial news
-    {"url": "https://feeds.reuters.com/reuters/businessNews",         "source": "reuters.com",    "tier": 1.0},
+    {"url": "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx6TVdZU0FtVnVHZ0pWVXlnQVAB", "source": "google-news-business", "tier": 0.8},
     {"url": "https://www.cnbc.com/id/100003114/device/rss/rss.html",  "source": "cnbc.com",       "tier": 0.8},
     {"url": "https://feeds.marketwatch.com/marketwatch/topstories",   "source": "marketwatch.com","tier": 0.8},
     {"url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839135", "source": "cnbc.com", "tier": 0.8},
@@ -219,7 +276,13 @@ RSS_FEEDS: list[dict] = [
     {"url": "https://seekingalpha.com/market_currents.xml",           "source": "seekingalpha.com","tier": 0.5},
     # Tier 4 — Regulatory
     {"url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=&dateb=&owner=include&count=40&output=atom", "source": "sec.gov", "tier": 0.9},
-    {"url": "https://www.cftc.gov/rss/pressreleases",                 "source": "cftc.gov",       "tier": 0.9},
+    {"url": "https://www.cftc.gov/PressRoom/PressReleases/rss.xml",    "source": "cftc.gov",       "tier": 0.9},
+    # Tier 2 — Commodities / Energy / Metals
+    {"url": "https://oilprice.com/rss/main",                            "source": "oilprice.com",    "tier": 0.7},
+    {"url": "https://www.kitco.com/news/category/mining/rss",           "source": "kitco.com",       "tier": 0.7},
+    {"url": "https://mining.com/tag/gold/feed/",                        "source": "mining.com",      "tier": 0.6},
+    {"url": "https://mining.com/tag/copper/feed/",                      "source": "mining.com",      "tier": 0.6},
+    {"url": "https://www.eia.gov/rss/todayinenergy.xml",                "source": "eia.gov",         "tier": 0.8},
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────

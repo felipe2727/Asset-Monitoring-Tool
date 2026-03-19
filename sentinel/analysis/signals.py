@@ -77,7 +77,8 @@ def compute_social_sentiment(
     """
     SocialSentiment = 0.4 × CurrentSocial + 0.3 × SocialMomentum + 0.2 × MentionVolume + 0.1 × InfluencerWeight
     """
-    rel_tweets  = [t for t in tweets  if t.get("asset_symbol") == symbol]
+    rel_tweets  = [t for t in tweets  if t.get("asset_symbol") == symbol
+                   or symbol in t.get("_mentioned_assets", [])]
     rel_reddit  = [p for p in reddit_posts if p.get("asset_symbol") == symbol
                    or symbol in p.get("_mentioned_assets", [])]
 
@@ -325,11 +326,22 @@ def compute_regulatory_signal(articles: list[dict], symbol: str, asset_class: st
     relevant_regulatory: list[dict] = []
     for art in articles:
         if symbol not in art.get("asset_symbols", []) and symbol not in art.get("title", ""):
-            # Also include broad crypto regulatory news for crypto assets
+            # Include broad crypto regulatory news for crypto assets
             if asset_class == "crypto":
                 text = (art.get("title", "") + art.get("summary", "")).lower()
                 if not any(kw in text for kw in ["crypto", "bitcoin", "ethereum", "defi", "stablecoin"]):
                     continue
+            # Include broad commodity regulatory news for commodity assets
+            elif asset_class == "commodity":
+                text = (art.get("title", "") + art.get("summary", "")).lower()
+                if not any(kw in text for kw in [
+                    "oil", "crude", "opec", "gold", "silver", "copper",
+                    "natural gas", "commodity", "mining", "tariff",
+                    "sanctions", "strategic reserve", "eia", "inventory",
+                ]):
+                    continue
+            else:
+                continue
 
         if art.get("_is_regulatory") or any(
             kw in (art.get("title", "") + art.get("summary", "")).lower()

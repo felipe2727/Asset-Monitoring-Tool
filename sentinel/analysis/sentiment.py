@@ -126,7 +126,22 @@ async def run_sentiment_analysis(items: list[dict]) -> list[dict]:
             item["sentiment_confidence"] = 0.0
         return items
 
-    texts = [item.get("text", "") for item in items]
+    # Filter out items with empty text — give them default scores without API call
+    items_with_text = []
+    for item in items:
+        text = item.get("text", "").strip()
+        if not text:
+            item["sentiment_score"] = 0.0
+            item["sentiment_confidence"] = 0.0
+            item["_sentiment_meta"] = _default_result()
+        else:
+            items_with_text.append(item)
+
+    if not items_with_text:
+        logger.info("Sentiment: all %d items had empty text — skipped API call", len(items))
+        return items
+
+    texts = [item.get("text", "") for item in items_with_text]
 
     # Process in batches to stay within token limits and rate limits
     all_results: list[dict] = []
@@ -145,8 +160,8 @@ async def run_sentiment_analysis(items: list[dict]) -> list[dict]:
         if i + SENTIMENT_BATCH_SIZE < len(texts):
             await asyncio.sleep(1.0)
 
-    # Merge results back into items
-    for item, result in zip(items, all_results):
+    # Merge results back into items that had text
+    for item, result in zip(items_with_text, all_results):
         item["sentiment_score"]      = float(result.get("sentiment", 0.0))
         item["sentiment_confidence"] = float(result.get("confidence", 0.0))
         item["_sentiment_meta"]      = result

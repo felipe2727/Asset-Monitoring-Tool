@@ -1,9 +1,8 @@
 """
 Market data ingestion:
-  - yfinance: stocks, ETFs, commodities, REITs (historical OHLCV + technicals)
-  - CoinGecko: crypto prices, volume, market cap (no API key needed)
-  - Finnhub: real-time quotes, news (free tier, optional)
-  - Alpha Vantage: RSI, MACD (free tier, 25 calls/day, optional)
+  - Finnhub: real-time stock/ETF quotes (free tier)
+  - Alpha Vantage: daily OHLCV history for technicals (free tier, 25 calls/day)
+  - CoinGecko: crypto prices, volume, market cap, history (no API key needed)
 """
 import asyncio
 import logging
@@ -15,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from sentinel.config import (
-    get_active_assets, FINNHUB_API_KEY, ALPHA_VANTAGE_API_KEY,
+    get_active_assets, FINNHUB_API_KEY, ALPHA_VANTAGE_API_KEY, FRED_API_KEY,
 )
 
 logger = logging.getLogger(__name__)
@@ -89,21 +88,50 @@ def _compute_volatility_30d(closes: pd.Series) -> Optional[float]:
 # Finnhub (stocks, ETFs, commodities, REITs)
 # ─────────────────────────────────────────────────────────────────────────────
 
+async def _fetch_av_daily(client: httpx.AsyncClient, symbol: str) -> tuple[pd.Series, pd.Series]:
+    """Fetches daily OHLCV from Alpha Vantage. Returns (closes, volumes) Series."""
+    if not ALPHA_VANTAGE_API_KEY:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+    try:
+        resp = await client.get(
+            AV_BASE,
+            params={
+                "function": "TIME_SERIES_DAILY",
+                "symbol": symbol,
+                "outputsize": "compact",  # last 100 days
+                "apikey": ALPHA_VANTAGE_API_KEY,
+            },
+            timeout=20,
+        )
+        data = resp.json()
+        ts = data.get("Time Series (Daily)", {})
+        if not ts:
+            logger.warning("  Alpha Vantage %s: no data (%s)", symbol, list(data.keys())[:2])
+            return pd.Series(dtype=float), pd.Series(dtype=float)
+        # Sort by date ascending
+        sorted_dates = sorted(ts.keys())
+        closes  = pd.Series([float(ts[d]["4. close"]) for d in sorted_dates])
+        volumes = pd.Series([float(ts[d]["5. volume"]) for d in sorted_dates])
+        logger.info("  Alpha Vantage %s: %d days of history", symbol, len(closes))
+        return closes, volumes
+    except Exception as exc:
+        logger.warning("  Alpha Vantage %s: %s", symbol, exc)
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+
+
 async def _fetch_finnhub_data(symbols: list[str]) -> list[dict]:
-    """Fetches OHLCV + technicals for stock/ETF symbols via Finnhub free API."""
+    """Fetches quotes via Finnhub + daily history via Alpha Vantage for technicals."""
     if not FINNHUB_API_KEY:
         logger.warning("FINNHUB_API_KEY not set — skipping stock market data")
         return []
 
     today_str = date.today().isoformat()
-    to_ts   = int(datetime.now().timestamp())
-    from_ts = int((datetime.now() - timedelta(days=90)).timestamp())
 
     results = []
     async with httpx.AsyncClient() as client:
         for symbol in symbols:
             try:
-                # Current quote
+                # Current quote from Finnhub (free, works)
                 q_resp = await client.get(
                     f"{FINNHUB_BASE}/quote",
                     params={"symbol": symbol, "token": FINNHUB_API_KEY},
@@ -116,22 +144,13 @@ async def _fetch_finnhub_data(symbols: list[str]) -> list[dict]:
                     logger.warning("  Finnhub %s: no quote data", symbol)
                     continue
 
-                # Daily candles for technicals (90 days)
-                c_resp = await client.get(
-                    f"{FINNHUB_BASE}/stock/candle",
-                    params={
-                        "symbol":     symbol,
-                        "resolution": "D",
-                        "from":       from_ts,
-                        "to":         to_ts,
-                        "token":      FINNHUB_API_KEY,
-                    },
-                    timeout=15,
-                )
-                candle = c_resp.json() if c_resp.is_success else {}
-                closes  = pd.Series(candle.get("c", [current]))
-                volumes = pd.Series(candle.get("v", [0]))
-                last_vol = int(candle["v"][-1]) if candle.get("v") else 0
+                # Daily history from Alpha Vantage (Finnhub candles are 403 on free tier)
+                closes, volumes = await _fetch_av_daily(client, symbol)
+                if closes.empty:
+                    closes  = pd.Series([current])
+                    volumes = pd.Series([0])
+
+                last_vol = int(volumes.iloc[-1]) if len(volumes) > 0 else 0
                 avg_vol  = float(volumes.tail(20).mean()) if len(volumes) >= 20 else float(volumes.mean())
 
                 results.append({
@@ -152,8 +171,8 @@ async def _fetch_finnhub_data(symbols: list[str]) -> list[dict]:
                 })
                 logger.debug("  Finnhub %s: close=%.2f", symbol, current)
 
-                # Finnhub free: 60 req/min — stay safe
-                await asyncio.sleep(0.6)
+                # Alpha Vantage free: 5 calls/min — pace at 13s per symbol
+                await asyncio.sleep(13)
 
             except Exception as exc:
                 logger.warning("  Finnhub %s: %s", symbol, exc)
@@ -246,6 +265,150 @@ async def _fetch_coingecko_data(assets) -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FRED (commodity spot prices — gold, oil, natgas, copper)
+# ─────────────────────────────────────────────────────────────────────────────
+
+FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
+
+# Maps FRED series to our ETF symbols (daily series only)
+FRED_COMMODITY_SERIES: dict[str, str] = {
+    "DCOILWTICO": "USO",   # WTI Crude Oil spot price (daily)
+    "DHHNGSP":    "UNG",   # Henry Hub Natural Gas spot (daily)
+}
+
+
+async def _fetch_fred_spot_prices(client: httpx.AsyncClient) -> dict[str, float]:
+    """
+    Fetches latest commodity spot prices from FRED.
+    Returns {symbol: spot_price} e.g. {"GLD": 3025.50, "USO": 68.20}.
+    """
+    if not FRED_API_KEY:
+        return {}
+
+    spot_prices: dict[str, float] = {}
+    for series_id, symbol in FRED_COMMODITY_SERIES.items():
+        try:
+            resp = await client.get(
+                FRED_BASE,
+                params={
+                    "series_id": series_id,
+                    "api_key": FRED_API_KEY,
+                    "file_type": "json",
+                    "sort_order": "desc",
+                    "limit": 5,  # last 5 observations to find non-"." value
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            observations = data.get("observations", [])
+            for obs in observations:
+                val = obs.get("value", ".")
+                if val != ".":
+                    spot_prices[symbol] = float(val)
+                    logger.info("  FRED %s (%s): $%.2f", symbol, series_id, float(val))
+                    break
+        except Exception as exc:
+            logger.warning("  FRED %s: %s", series_id, exc)
+
+    return spot_prices
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CoinCap (crypto fallback when CoinGecko fails)
+# ─────────────────────────────────────────────────────────────────────────────
+
+COINCAP_BASE = "https://api.coincap.io/v2"
+
+# Maps our symbols to CoinCap asset IDs
+COINCAP_IDS: dict[str, str] = {
+    "BTC":  "bitcoin",
+    "ETH":  "ethereum",
+    "SOL":  "solana",
+    "AVAX": "avalanche",
+    "LINK": "chainlink",
+    "DOT":  "polkadot",
+    "NEAR": "near-protocol",
+    "SUI":  "sui",
+    "ARB":  "arbitrum",
+    "OP":   "optimism",
+    "INJ":  "injective-protocol",
+    "APT":  "aptos",
+}
+
+
+async def _fetch_coincap_data(assets) -> list[dict]:
+    """Fallback crypto data from CoinCap (no API key needed)."""
+    coingecko_assets = [(a.symbol, a.coingecko_id) for a in assets if a.coingecko_id]
+    if not coingecko_assets:
+        return []
+
+    today = date.today().isoformat()
+    results = []
+
+    try:
+        async with httpx.AsyncClient() as client:
+            for symbol, _ in coingecko_assets:
+                coincap_id = COINCAP_IDS.get(symbol)
+                if not coincap_id:
+                    continue
+                try:
+                    # Current price
+                    resp = await client.get(
+                        f"{COINCAP_BASE}/assets/{coincap_id}", timeout=15,
+                    )
+                    resp.raise_for_status()
+                    coin = resp.json().get("data", {})
+                    if not coin:
+                        continue
+
+                    price = float(coin.get("priceUsd", 0))
+                    volume = float(coin.get("volumeUsd24Hr", 0))
+                    mcap = float(coin.get("marketCapUsd", 0))
+
+                    # 60-day history for technicals
+                    end_ms = int(datetime.utcnow().timestamp() * 1000)
+                    start_ms = end_ms - 60 * 86400 * 1000
+                    hist_resp = await client.get(
+                        f"{COINCAP_BASE}/assets/{coincap_id}/history",
+                        params={"interval": "d1", "start": start_ms, "end": end_ms},
+                        timeout=15,
+                    )
+                    hist_data = hist_resp.json().get("data", [])
+                    if hist_data:
+                        prices_series = pd.Series([float(d["priceUsd"]) for d in hist_data])
+                    else:
+                        prices_series = pd.Series([price])
+
+                    results.append({
+                        "symbol":             symbol,
+                        "date":               today,
+                        "open":               None,
+                        "high":               None,
+                        "low":                None,
+                        "close":              price,
+                        "volume":             int(volume),
+                        "market_cap":         mcap,
+                        "rsi_14":             _compute_rsi(prices_series),
+                        "macd_signal":        _compute_macd_signal(prices_series),
+                        "bollinger_position": _compute_bollinger_position(prices_series),
+                        "volatility_30d":     _compute_volatility_30d(prices_series),
+                        "avg_volume_20d":     None,
+                        "volume_zscore":      None,
+                    })
+                    logger.debug("  CoinCap %s: $%.4f", symbol, price)
+                    await asyncio.sleep(0.5)
+
+                except Exception as exc:
+                    logger.warning("  CoinCap %s: %s", symbol, exc)
+
+    except Exception as exc:
+        logger.error("CoinCap error: %s", exc)
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -259,18 +422,30 @@ async def fetch_market_data() -> dict[str, dict]:
     stock_symbols    = [a.symbol for a in assets if a.asset_class in ("stock", "commodity", "reit")]
     crypto_assets    = [a for a in assets if a.asset_class == "crypto"]
 
-    # Fetch stocks/ETFs via Finnhub (async)
+    # Fetch stocks/ETFs via Finnhub + Alpha Vantage
     stock_rows = await _fetch_finnhub_data(stock_symbols)
 
-    # Fetch crypto async
+    # Fetch crypto: CoinGecko primary, CoinCap fallback
     crypto_rows = await _fetch_coingecko_data(crypto_assets)
+    if not crypto_rows:
+        logger.warning("CoinGecko returned no data — falling back to CoinCap")
+        crypto_rows = await _fetch_coincap_data(crypto_assets)
 
     all_rows = stock_rows + crypto_rows
     by_symbol = {r["symbol"]: r for r in all_rows}
 
+    # Enrich commodity ETFs with FRED spot prices
+    async with httpx.AsyncClient() as client:
+        fred_spots = await _fetch_fred_spot_prices(client)
+    for symbol, spot_price in fred_spots.items():
+        if symbol in by_symbol:
+            by_symbol[symbol]["_spot_price"] = spot_price
+        else:
+            logger.debug("  FRED spot for %s but no market row — skipping", symbol)
+
     logger.info(
-        "Market data: %d stocks/ETFs, %d crypto (%d total)",
-        len(stock_rows), len(crypto_rows), len(all_rows),
+        "Market data: %d stocks/ETFs, %d crypto, %d FRED spots (%d total)",
+        len(stock_rows), len(crypto_rows), len(fred_spots), len(all_rows),
     )
     return by_symbol
 

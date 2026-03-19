@@ -58,7 +58,7 @@ async def run_pipeline() -> None:
     console.rule(f"[bold blue]SENTINEL DAILY RADAR — {today}[/bold blue]")
 
     # ── Import all modules (deferred to avoid slow startup) ──────────────────
-    from sentinel.config import FREE_TRIAL_MODE, RUN_NUMBER, get_active_assets
+    from sentinel.config import FREE_TRIAL_MODE, RUN_NUMBER, SUBREDDITS, get_active_assets
     from sentinel.database.client import init_db, upsert_assets, upsert_market_data, insert_tweets, insert_reddit_posts, insert_news_articles, upsert_daily_signals
     from sentinel.ingestion.twitter import scrape_twitter
     from sentinel.ingestion.reddit import scrape_reddit
@@ -90,7 +90,7 @@ async def run_pipeline() -> None:
     ])
 
     # ── Step 1: Scrape X/Twitter ─────────────────────────────────────────────
-    logger.info("[1/12] Scraping X/Twitter via Scrapingdog...")
+    logger.info("[1/12] Scraping X/Twitter (ScrapeBadger → Scrapingdog → StockTwits)...")
     try:
         tweets = await scrape_twitter()
         insert_tweets(tweets)
@@ -100,7 +100,7 @@ async def run_pipeline() -> None:
         tweets = []
 
     # ── Step 2: Scrape Reddit ────────────────────────────────────────────────
-    logger.info("[2/12] Scraping Reddit (public JSON API)...")
+    logger.info("[2/12] Scraping Reddit (ArcticShift → RSS → PullPush)...")
     try:
         reddit_posts = await scrape_reddit()
         insert_reddit_posts(reddit_posts)
@@ -120,7 +120,7 @@ async def run_pipeline() -> None:
         articles = []
 
     # ── Step 4: Fetch market data ────────────────────────────────────────────
-    logger.info("[4/12] Fetching market data (yfinance + CoinGecko)...")
+    logger.info("[4/12] Fetching market data (Finnhub + Alpha Vantage + CoinGecko)...")
     try:
         market_data = await fetch_market_data()
         macro_context = await fetch_macro_context()
@@ -150,15 +150,42 @@ async def run_pipeline() -> None:
     except Exception as exc:
         logger.error("Firecrawl failed: %s", exc)
 
+    # ── Step 6.5: Data quality manifest ───────────────────────────────────
+    manifest = {
+        "tweets": len(tweets),
+        "reddit_posts": len(reddit_posts),
+        "articles": len(articles),
+        "market_symbols": len(market_data),
+        "gdelt_events": len(gdelt_events),
+    }
+    logger.info("Data manifest: %s", manifest)
+
+    expected = {"tweets": len(assets) * 10, "reddit_posts": len(SUBREDDITS) * 50,
+                "articles": 100, "market_symbols": len(assets), "gdelt_events": 1}
+    for key, actual in manifest.items():
+        exp = expected.get(key, 1)
+        if exp > 0 and actual < exp * 0.1:
+            logger.warning("  LOW DATA: %s = %d (expected ~%d)", key, actual, exp)
+
     # ── Step 7: LLM Sentiment Analysis ──────────────────────────────────────
     logger.info("[7/12] Running LLM sentiment analysis (GPT-4o-mini)...")
-    total_items = len(tweets) + len(reddit_posts) + len(articles)
     try:
-        tweets        = await analyze_tweets(tweets)
-        reddit_posts  = await analyze_reddit_posts(reddit_posts)
-        articles      = await analyze_articles(articles)
-        scored_count  = sum(1 for t in tweets + reddit_posts + articles
-                           if t.get("sentiment_confidence", 0) > 0.3)
+        if tweets:
+            tweets = await analyze_tweets(tweets)
+        else:
+            logger.info("  Skipping tweet sentiment (0 tweets)")
+        if reddit_posts:
+            reddit_posts = await analyze_reddit_posts(reddit_posts)
+        else:
+            logger.info("  Skipping Reddit sentiment (0 posts)")
+        if articles:
+            articles = await analyze_articles(articles)
+        else:
+            logger.info("  Skipping article sentiment (0 articles)")
+
+        total_items = len(tweets) + len(reddit_posts) + len(articles)
+        scored_count = sum(1 for t in tweets + reddit_posts + articles
+                          if t.get("sentiment_confidence", 0) > 0.3)
         logger.info("  ->%d/%d items scored with confidence >0.3", scored_count, total_items)
     except Exception as exc:
         logger.error("Sentiment analysis failed: %s", exc)

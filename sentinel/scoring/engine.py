@@ -38,10 +38,10 @@ SIGNAL_KEYS = [
 
 def _check_investability(signal_row: dict, market_row: Optional[dict]) -> float:
     """
-    Returns 0.0 if asset fails any hard filter, else 0.6-1.0 based on quality.
+    Returns 0.0 if asset fails any hard filter, else 0.3-1.0 based on data quality.
     """
     if not market_row:
-        return 0.6  # no data but don't disqualify entirely
+        return 0.3  # heavy penalty for zero market data
 
     asset_class = signal_row.get("_asset_class", "stock")
     market_cap  = market_row.get("market_cap") or 0
@@ -61,17 +61,23 @@ def _check_investability(signal_row: dict, market_row: Optional[dict]) -> float:
         logger.debug("  Filter: %s severe regulatory red flag", symbol)
         return 0.0
 
-    # Data coverage check (count non-zero signals)
+    # Data coverage check — count ALL non-zero signals
     data_sources = sum(
-        1 for k in ["news_sentiment", "social_sentiment", "volume_anomaly", "momentum_score"]
+        1 for k in SIGNAL_KEYS
         if abs(signal_row.get(k, 0.0)) > 0.001
     )
-    if data_sources < 1:
-        # During bootstrap (first run), be lenient
-        logger.debug("  Filter: %s low data coverage (%d sources)", symbol, data_sources)
-        investability = 0.6
+    if data_sources < 3:
+        logger.debug("  Filter: %s low data coverage (%d/11 signals)", symbol, data_sources)
+        investability = 0.4 + 0.05 * data_sources  # 0.4 to 0.55
     else:
-        investability = 0.6 + 0.1 * min(data_sources, 4)  # 0.6 to 1.0
+        investability = 0.5 + 0.05 * min(data_sources, 10)  # 0.65 to 1.0
+
+    # Data completeness multiplier: penalize missing market data fields
+    populated = sum(1 for k in ["rsi_14", "macd_signal", "bollinger_position",
+                                 "volatility_30d", "volume_zscore", "market_cap"]
+                    if market_row.get(k) is not None)
+    completeness = 0.5 + 0.5 * (populated / 6.0)  # 0.5 to 1.0
+    investability *= completeness
 
     return min(1.0, investability)
 
@@ -117,7 +123,8 @@ def _zscore_within_class(
     Returns {symbol: z_score}.
     """
     class_rows = [r for r in signal_rows if r.get("_asset_class") == asset_class]
-    if len(class_rows) < 2:
+    if len(class_rows) < 3:
+        # Too few members for stable z-scores — return raw values
         return {r["symbol"]: r.get(signal_key, 0.0) for r in class_rows}
 
     values = np.array([r.get(signal_key, 0.0) for r in class_rows], dtype=float)
