@@ -13,17 +13,63 @@ import pandas as pd
 
 from sentinel.config import (
     get_active_assets, BASE_WEIGHTS, SOURCE_TIERS,
+    GEOPOLITICAL_KEYWORDS, REGULATORY_KEYWORDS, EXCLUSION_KEYWORDS,
 )
 from sentinel.database.client import get_price_history, get_latest_weights
 
 logger = logging.getLogger(__name__)
 
-# Regulatory keywords for signal 8
+# Legacy flat list (kept for backward compat, but tiered version is preferred)
 REGULATORY_KEYWORDS_LIST = [
     "sec ", "regulation", "ban ", "approved", "etf filing", "cftc", "mica",
     "stablecoin", "executive order", "enforcement", "fine ", "settlement",
     "esma", "compliance", "lawsuit", "subpoena", "penalty",
 ]
+
+
+def _classify_text_threat(text: str) -> tuple[float, str]:
+    """
+    Classifies text against the tiered geopolitical keyword taxonomy.
+    Returns (weight, tier_name) of the highest-severity match, or (0.0, "none").
+    """
+    text_lower = text.lower()
+
+    # Check exclusion list first
+    if any(kw in text_lower for kw in EXCLUSION_KEYWORDS):
+        return 0.0, "excluded"
+
+    # Check tiers from highest to lowest severity
+    for tier_name in ("critical", "high", "medium", "low"):
+        tier = GEOPOLITICAL_KEYWORDS.get(tier_name, {})
+        keywords = tier.get("keywords", [])
+        if any(kw in text_lower for kw in keywords):
+            return tier.get("weight", 0.2), tier_name
+
+    return 0.0, "none"
+
+
+def _classify_regulatory_text(text: str) -> tuple[float, str]:
+    """
+    Classifies text against the tiered regulatory keyword taxonomy.
+    Returns (weight, tier_name) of the highest-severity match, or (0.0, "none").
+    """
+    text_lower = text.lower()
+
+    # Check exclusion list first
+    if any(kw in text_lower for kw in EXCLUSION_KEYWORDS):
+        return 0.0, "excluded"
+
+    for tier_name in ("critical", "high", "medium", "low"):
+        tier = REGULATORY_KEYWORDS.get(tier_name, {})
+        keywords = tier.get("keywords", [])
+        if any(kw in text_lower for kw in keywords):
+            return tier.get("weight", 0.2), tier_name
+
+    # Fallback to legacy flat list
+    if any(kw in text_lower for kw in REGULATORY_KEYWORDS_LIST):
+        return 0.2, "legacy"
+
+    return 0.0, "none"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -320,10 +366,12 @@ def compute_risk_adjusted_liquidity(market_row: Optional[dict], asset_class: str
 
 def compute_regulatory_signal(articles: list[dict], symbol: str, asset_class: str) -> float:
     """
-    RegulatoryScore from SEC/CFTC RSS + news filtered for regulatory keywords.
+    RegulatoryScore from SEC/CFTC RSS + news filtered for tiered regulatory keywords.
+    Uses severity-weighted scoring (critical events count 5x more than low events).
     Returns -1 (strongly negative) to +1 (strongly positive).
     """
-    relevant_regulatory: list[dict] = []
+    relevant_regulatory: list[tuple[dict, float]] = []  # (article, severity_weight)
+
     for art in articles:
         if symbol not in art.get("asset_symbols", []) and symbol not in art.get("title", ""):
             # Include broad crypto regulatory news for crypto assets
@@ -343,35 +391,48 @@ def compute_regulatory_signal(articles: list[dict], symbol: str, asset_class: st
             else:
                 continue
 
-        if art.get("_is_regulatory") or any(
-            kw in (art.get("title", "") + art.get("summary", "")).lower()
-            for kw in REGULATORY_KEYWORDS_LIST
-        ):
-            relevant_regulatory.append(art)
+        text = art.get("title", "") + " " + art.get("summary", "")
+        reg_weight, reg_tier = _classify_regulatory_text(text)
+
+        if reg_tier == "excluded":
+            continue
+
+        if reg_weight > 0 or art.get("_is_regulatory"):
+            # Use the higher of tiered weight or default 0.2 for _is_regulatory
+            weight = max(reg_weight, 0.2 if art.get("_is_regulatory") else 0.0)
+            relevant_regulatory.append((art, weight))
 
     if not relevant_regulatory:
         return 0.0
 
-    # Score each regulatory event
-    event_scores: list[float] = []
-    for art in relevant_regulatory:
+    # Score each regulatory event (severity-weighted)
+    weighted_scores: list[float] = []
+    total_weight = 0.0
+
+    for art, severity_weight in relevant_regulatory:
         sentiment = art.get("sentiment_score", 0.0)
         meta = art.get("_sentiment_meta", {})
 
         if meta.get("is_regulatory"):
             rd = meta.get("regulatory_direction", "neutral")
             if rd == "positive":
-                event_scores.append(1.0)
+                event_score = 1.0
             elif rd == "negative":
-                event_scores.append(-1.0)
+                event_score = -1.0
             elif rd == "neutral":
-                event_scores.append(0.0)
+                event_score = 0.0
             else:
-                event_scores.append(sentiment)
+                event_score = sentiment
         else:
-            event_scores.append(sentiment)
+            event_score = sentiment
 
-    score = float(np.mean(event_scores)) if event_scores else 0.0
+        weighted_scores.append(event_score * severity_weight)
+        total_weight += severity_weight
+
+    if total_weight == 0:
+        return 0.0
+
+    score = sum(weighted_scores) / total_weight
     return float(np.clip(score, -1.0, 1.0))
 
 
@@ -481,11 +542,19 @@ def compute_all_signals(
     articles: list[dict],
     market_data: dict[str, dict],
     gdelt_events: list[dict],
+    prediction_events: list[dict] | None = None,
+    disaster_events: list[dict] | None = None,
+    acled_events: list[dict] | None = None,
 ) -> dict:
     """
     Computes all 11 signals for one asset and returns a dict ready for DB insertion.
+    Now incorporates prediction markets, disaster events, and ACLED conflict data
+    into the geopolitical_flow and regulatory_signal computations.
     """
     from sentinel.ingestion.gdelt import compute_geopolitical_score
+    from sentinel.ingestion.polymarket import compute_prediction_market_signal
+    from sentinel.ingestion.disasters import compute_disaster_signal
+    from sentinel.ingestion.acled import compute_conflict_signal
 
     mkt = market_data.get(symbol)
 
@@ -498,8 +567,62 @@ def compute_all_signals(
     risk_s    = compute_risk_adjusted_liquidity(mkt, asset_class)
     reg_s     = compute_regulatory_signal(articles, symbol, asset_class)
     comp_s    = compute_competitor_edge(symbol, peers, articles, market_data)
-    geo_s     = compute_geopolitical_score(gdelt_events, symbol)
     fresh_s   = compute_catalyst_freshness(articles, symbol)
+
+    # ── Enhanced geopolitical_flow: combine GDELT + ACLED + Polymarket + disasters ──
+    gdelt_score = compute_geopolitical_score(gdelt_events, symbol)
+
+    # Prediction market signal (regulatory + geopolitical)
+    pred_score = compute_prediction_market_signal(prediction_events or [], symbol)
+
+    # Disaster/environmental signal
+    disaster_score = compute_disaster_signal(disaster_events or [], symbol)
+
+    # ACLED conflict signal
+    conflict_score = compute_conflict_signal(acled_events or [], symbol)
+
+    # Weighted combination: GDELT (0.3) + ACLED (0.3) + Prediction Markets (0.2) + Disasters (0.2)
+    geo_components = []
+    geo_weights = []
+
+    if gdelt_score != 0.0:
+        geo_components.append(gdelt_score)
+        geo_weights.append(0.3)
+    if conflict_score != 0.0:
+        geo_components.append(conflict_score)
+        geo_weights.append(0.3)
+    if pred_score != 0.0:
+        geo_components.append(pred_score)
+        geo_weights.append(0.2)
+    if disaster_score != 0.0:
+        geo_components.append(disaster_score)
+        geo_weights.append(0.2)
+
+    if geo_components:
+        total_weight = sum(geo_weights)
+        geo_s = sum(c * w for c, w in zip(geo_components, geo_weights)) / total_weight
+        geo_s = float(np.clip(geo_s, -1.0, 1.0))
+    else:
+        geo_s = 0.0
+
+    # ── Enhance regulatory signal with prediction market data ──
+    if pred_score != 0.0 and reg_s != 0.0:
+        # Blend: 70% article-based, 30% prediction-market-based
+        reg_s = 0.7 * reg_s + 0.3 * pred_score
+        reg_s = float(np.clip(reg_s, -1.0, 1.0))
+
+    # ── Enhance volume_anomaly for energy assets with EIA data ──
+    if mkt and mkt.get("_eia"):
+        eia = mkt["_eia"]
+        inv_change = eia.get("inventory_change", 0)
+        if inv_change != 0:
+            # Inventory draw (negative change) = bullish for USO/UNG
+            # Inventory build (positive change) = bearish
+            eia_signal = -inv_change / 5000.0  # normalize: 5M barrel change -> +-1.0
+            eia_signal = float(np.clip(eia_signal, -0.5, 0.5))
+            # Blend with existing volume signal
+            volume_s = 0.7 * volume_s + 0.3 * eia_signal
+            volume_s = float(np.clip(volume_s, -1.0, 1.0))
 
     today = date.today().isoformat()
 

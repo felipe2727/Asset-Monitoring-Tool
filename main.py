@@ -1,27 +1,31 @@
 """
-Sentinel — Daily Asset Intelligence Pipeline
+Sentinel -- Daily Asset Intelligence Pipeline
 ============================================
 Run with:  python main.py
 
 Controls:
   RUN_NUMBER=1|2|3|4   ->Selects Scrapingdog key rotation (see FREE-TRIAL-RUN-PLAN.md)
   FREE_TRIAL_MODE=true  ->15 assets, 10 tweets each (default)
-  FREE_TRIAL_MODE=false → Full 50 assets, 20 tweets each (production)
+  FREE_TRIAL_MODE=false -> Full 50 assets, 20 tweets each (production)
 
 The pipeline:
-  1.  Scrape X/Twitter via Scrapingdog
-  2.  Scrape Reddit via PRAW
-  3.  Fetch RSS feeds
-  4.  Pull market data (yfinance, CoinGecko)
-  5.  Fetch full article text (Firecrawl)
-  6.  Run LLM sentiment (OpenAI GPT-4o-mini)
-  7.  Compute 11 signals per asset
-  8.  Composite scoring + ranking
-  9.  Evaluate yesterday's picks (backtest)
-  10. Update dynamic signal weights
-  11. Generate HTML email
-  12. Send via Resend (or save to file)
-  13. Log everything to SQLite
+  1.  Scrape X/Twitter (ScrapeBadger -> Scrapingdog -> StockTwits)
+  2.  Scrape Reddit (ArcticShift -> RSS -> PullPush)
+  3.  Fetch RSS feeds (25+ sources incl. wire services + geopolitical)
+  4.  Pull market data (Finnhub + Alpha Vantage + Yahoo fallback + CoinGecko)
+  5.  Fetch GDELT geopolitical events
+  6.  Fetch prediction markets (Polymarket + Kalshi)
+  7.  Fetch disaster events (USGS + NASA FIRMS + Cloudflare Radar)
+  8.  Fetch ACLED conflict events
+  9.  Fetch full article text (Firecrawl)
+  10. Run LLM sentiment (OpenAI GPT-4o-mini)
+  11. Compute 11 signals per asset (enhanced with new data sources)
+  12. Composite scoring + ranking
+  13. Evaluate yesterday's picks (backtest)
+  14. Update dynamic signal weights
+  15. Generate HTML email
+  16. Send via Resend (or save to file)
+  17. Log everything to SQLite
 """
 import asyncio
 import logging
@@ -34,7 +38,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
-# ─── Setup logging ────────────────────────────────────────────────────────────
+# --- Setup logging -----------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(message)s",
@@ -55,9 +59,9 @@ async def run_pipeline() -> None:
     start_time = time.time()
     today = date.today().isoformat()
 
-    console.rule(f"[bold blue]SENTINEL DAILY RADAR — {today}[/bold blue]")
+    console.rule(f"[bold blue]SENTINEL DAILY RADAR -- {today}[/bold blue]")
 
-    # ── Import all modules (deferred to avoid slow startup) ──────────────────
+    # -- Import all modules (deferred to avoid slow startup) -------------------
     from sentinel.config import FREE_TRIAL_MODE, RUN_NUMBER, SUBREDDITS, get_active_assets
     from sentinel.database.client import init_db, upsert_assets, upsert_market_data, insert_tweets, insert_reddit_posts, insert_news_articles, upsert_daily_signals
     from sentinel.ingestion.twitter import scrape_twitter
@@ -66,6 +70,9 @@ async def run_pipeline() -> None:
     from sentinel.ingestion.firecrawl import fetch_full_text
     from sentinel.ingestion.market_data import fetch_market_data, fetch_macro_context
     from sentinel.ingestion.gdelt import fetch_gdelt_events
+    from sentinel.ingestion.polymarket import fetch_prediction_markets
+    from sentinel.ingestion.disasters import fetch_disaster_events
+    from sentinel.ingestion.acled import fetch_acled_events
     from sentinel.analysis.sentiment import analyze_tweets, analyze_reddit_posts, analyze_articles
     from sentinel.analysis.signals import compute_all_signals
     from sentinel.scoring.engine import compute_scores, get_top10
@@ -77,8 +84,8 @@ async def run_pipeline() -> None:
     mode_label = f"FREE TRIAL (Run #{RUN_NUMBER}, {len(assets)} assets)" if FREE_TRIAL_MODE else f"PRODUCTION ({len(assets)} assets)"
     logger.info("Mode: %s", mode_label)
 
-    # ── Step 0: Initialise database ──────────────────────────────────────────
-    logger.info("[0/12] Initialising database...")
+    # -- Step 0: Initialise database -------------------------------------------
+    logger.info("[0/16] Initialising database...")
     init_db()
     upsert_assets([
         {
@@ -89,8 +96,8 @@ async def run_pipeline() -> None:
         for a in assets
     ])
 
-    # ── Step 1: Scrape X/Twitter ─────────────────────────────────────────────
-    logger.info("[1/12] Scraping X/Twitter (ScrapeBadger → Scrapingdog → StockTwits)...")
+    # -- Step 1: Scrape X/Twitter ----------------------------------------------
+    logger.info("[1/16] Scraping X/Twitter (ScrapeBadger -> Scrapingdog -> StockTwits)...")
     try:
         tweets = await scrape_twitter()
         insert_tweets(tweets)
@@ -99,8 +106,8 @@ async def run_pipeline() -> None:
         logger.error("Twitter scrape failed: %s", exc)
         tweets = []
 
-    # ── Step 2: Scrape Reddit ────────────────────────────────────────────────
-    logger.info("[2/12] Scraping Reddit (ArcticShift → RSS → PullPush)...")
+    # -- Step 2: Scrape Reddit -------------------------------------------------
+    logger.info("[2/16] Scraping Reddit (ArcticShift -> RSS -> PullPush)...")
     try:
         reddit_posts = await scrape_reddit()
         insert_reddit_posts(reddit_posts)
@@ -109,54 +116,84 @@ async def run_pipeline() -> None:
         logger.error("Reddit scrape failed: %s", exc)
         reddit_posts = []
 
-    # ── Step 3: Fetch RSS feeds ──────────────────────────────────────────────
-    logger.info("[3/12] Fetching RSS feeds...")
+    # -- Step 3: Fetch RSS feeds -----------------------------------------------
+    logger.info("[3/16] Fetching RSS feeds (25+ sources incl. wire services)...")
     try:
         articles = await fetch_rss_feeds()
         insert_news_articles(articles)
-        logger.info("  ->%d articles stored", len(articles))
+        logger.info("  -> %d articles stored", len(articles))
     except Exception as exc:
         logger.error("RSS fetch failed: %s", exc)
         articles = []
 
-    # ── Step 4: Fetch market data ────────────────────────────────────────────
-    logger.info("[4/12] Fetching market data (Finnhub + Alpha Vantage + CoinGecko)...")
+    # -- Step 4: Fetch market data ---------------------------------------------
+    logger.info("[4/16] Fetching market data (Finnhub + AV + Yahoo + CoinGecko + EIA)...")
     try:
         market_data = await fetch_market_data()
         macro_context = await fetch_macro_context()
         market_rows = list(market_data.values())
         upsert_market_data(market_rows)
-        logger.info("  ->%d symbols with market data", len(market_data))
+        logger.info("  -> %d symbols with market data", len(market_data))
     except Exception as exc:
         logger.error("Market data fetch failed: %s", exc)
         market_data = {}
         macro_context = {}
 
-    # ── Step 5: Fetch GDELT geopolitical events ──────────────────────────────
-    logger.info("[5/12] Fetching GDELT geopolitical events...")
+    # -- Step 5: Fetch GDELT geopolitical events -------------------------------
+    logger.info("[5/16] Fetching GDELT geopolitical events...")
     try:
         gdelt_events = await fetch_gdelt_events()
-        logger.info("  ->%d GDELT events", len(gdelt_events))
+        logger.info("  -> %d GDELT events", len(gdelt_events))
     except Exception as exc:
         logger.warning("GDELT fetch failed: %s", exc)
         gdelt_events = []
 
-    # ── Step 6: Fetch full article text (Firecrawl) ──────────────────────────
-    logger.info("[6/12] Fetching full article text via Firecrawl...")
+    # -- Step 6: Fetch prediction markets (Polymarket + Kalshi) ----------------
+    logger.info("[6/16] Fetching prediction markets (Polymarket + Kalshi)...")
+    try:
+        prediction_events = await fetch_prediction_markets()
+        logger.info("  -> %d prediction market events", len(prediction_events))
+    except Exception as exc:
+        logger.warning("Prediction markets fetch failed: %s", exc)
+        prediction_events = []
+
+    # -- Step 7: Fetch disaster events (USGS + FIRMS + Cloudflare) -------------
+    logger.info("[7/16] Fetching disaster events (USGS + NASA FIRMS + Cloudflare)...")
+    try:
+        disaster_events = await fetch_disaster_events()
+        logger.info("  -> %d disaster events", len(disaster_events))
+    except Exception as exc:
+        logger.warning("Disaster events fetch failed: %s", exc)
+        disaster_events = []
+
+    # -- Step 8: Fetch ACLED conflict events -----------------------------------
+    logger.info("[8/16] Fetching ACLED conflict events...")
+    try:
+        acled_events = await fetch_acled_events()
+        logger.info("  -> %d ACLED conflict events", len(acled_events))
+    except Exception as exc:
+        logger.warning("ACLED fetch failed: %s", exc)
+        acled_events = []
+
+    # -- Step 9: Fetch full article text (Firecrawl) ---------------------------
+    logger.info("[9/16] Fetching full article text via Firecrawl...")
     try:
         articles = await fetch_full_text(articles)
         full_text_count = sum(1 for a in articles if a.get("full_text"))
-        logger.info("  ->%d/%d articles with full text", full_text_count, len(articles))
+        logger.info("  -> %d/%d articles with full text", full_text_count, len(articles))
     except Exception as exc:
         logger.error("Firecrawl failed: %s", exc)
 
-    # ── Step 6.5: Data quality manifest ───────────────────────────────────
+    # -- Step 9.5: Data quality manifest ---------------------------------------
     manifest = {
         "tweets": len(tweets),
         "reddit_posts": len(reddit_posts),
         "articles": len(articles),
         "market_symbols": len(market_data),
         "gdelt_events": len(gdelt_events),
+        "prediction_events": len(prediction_events),
+        "disaster_events": len(disaster_events),
+        "acled_events": len(acled_events),
     }
     logger.info("Data manifest: %s", manifest)
 
@@ -167,8 +204,8 @@ async def run_pipeline() -> None:
         if exp > 0 and actual < exp * 0.1:
             logger.warning("  LOW DATA: %s = %d (expected ~%d)", key, actual, exp)
 
-    # ── Step 7: LLM Sentiment Analysis ──────────────────────────────────────
-    logger.info("[7/12] Running LLM sentiment analysis (GPT-4o-mini)...")
+    # -- Step 10: LLM Sentiment Analysis ---------------------------------------
+    logger.info("[10/16] Running LLM sentiment analysis (GPT-4o-mini)...")
     try:
         if tweets:
             tweets = await analyze_tweets(tweets)
@@ -186,34 +223,37 @@ async def run_pipeline() -> None:
         total_items = len(tweets) + len(reddit_posts) + len(articles)
         scored_count = sum(1 for t in tweets + reddit_posts + articles
                           if t.get("sentiment_confidence", 0) > 0.3)
-        logger.info("  ->%d/%d items scored with confidence >0.3", scored_count, total_items)
+        logger.info("  -> %d/%d items scored with confidence >0.3", scored_count, total_items)
     except Exception as exc:
         logger.error("Sentiment analysis failed: %s", exc)
 
-    # ── Step 8: Compute all 11 signals per asset ─────────────────────────────
-    logger.info("[8/12] Computing signals for %d assets...", len(assets))
+    # -- Step 11: Compute all 11 signals per asset -----------------------------
+    logger.info("[11/16] Computing signals for %d assets (GDELT + ACLED + Polymarket + disasters)...", len(assets))
     signal_rows: list[dict] = []
     for asset in assets:
         try:
             row = compute_all_signals(
-                symbol      = asset.symbol,
-                asset_class = asset.asset_class,
-                benchmark   = asset.benchmark,
-                peers       = asset.peers,
-                tweets      = tweets,
-                reddit_posts = reddit_posts,
-                articles    = articles,
-                market_data = market_data,
-                gdelt_events = gdelt_events,
+                symbol           = asset.symbol,
+                asset_class      = asset.asset_class,
+                benchmark        = asset.benchmark,
+                peers            = asset.peers,
+                tweets           = tweets,
+                reddit_posts     = reddit_posts,
+                articles         = articles,
+                market_data      = market_data,
+                gdelt_events     = gdelt_events,
+                prediction_events = prediction_events,
+                disaster_events  = disaster_events,
+                acled_events     = acled_events,
             )
             signal_rows.append(row)
         except Exception as exc:
             logger.error("  Signal computation failed for %s: %s", asset.symbol, exc)
 
-    logger.info("  ->%d assets with signals computed", len(signal_rows))
+    logger.info("  -> %d assets with signals computed", len(signal_rows))
 
-    # ── Step 9: Composite scoring + ranking ──────────────────────────────────
-    logger.info("[9/12] Scoring and ranking...")
+    # -- Step 12: Composite scoring + ranking ----------------------------------
+    logger.info("[12/16] Scoring and ranking...")
     try:
         scored = compute_scores(signal_rows, market_data, articles)
         top10  = get_top10(scored)
@@ -232,25 +272,25 @@ async def run_pipeline() -> None:
         logger.error("Scoring failed: %s", exc)
         top10 = []
 
-    # ── Step 10: Backtest yesterday's predictions ─────────────────────────────
-    logger.info("[10/12] Evaluating yesterday's predictions...")
+    # -- Step 13: Backtest yesterday's predictions -----------------------------
+    logger.info("[13/16] Evaluating yesterday's predictions...")
     try:
         yesterday_results = evaluate_yesterday()
         if yesterday_results:
             hits = sum(1 for r in yesterday_results if r.get("hit_1d"))
-            logger.info("  ->Yesterday: %d/%d hits", hits, len(yesterday_results))
+            logger.info("  -> Yesterday: %d/%d hits", hits, len(yesterday_results))
     except Exception as exc:
         logger.warning("Backtest failed: %s", exc)
 
-    # ── Step 11: Update dynamic signal weights ────────────────────────────────
-    logger.info("[11/12] Updating signal weights...")
+    # -- Step 14: Update dynamic signal weights --------------------------------
+    logger.info("[14/16] Updating signal weights...")
     try:
         update_dynamic_weights()
     except Exception as exc:
         logger.warning("Weight update failed: %s", exc)
 
-    # ── Step 12: Generate and send email ─────────────────────────────────────
-    logger.info("[12/12] Generating and sending email digest...")
+    # -- Step 15-16: Generate and send email -----------------------------------
+    logger.info("[15/16] Generating and sending email digest...")
     try:
         scorecard = build_scorecard_summary()
         html = render_email(
@@ -264,12 +304,14 @@ async def run_pipeline() -> None:
     except Exception as exc:
         logger.error("Email generation/send failed: %s", exc)
 
-    # ── Done ──────────────────────────────────────────────────────────────────
+    # -- Done ------------------------------------------------------------------
     elapsed = time.time() - start_time
     console.rule(f"[bold green]Pipeline complete in {elapsed:.0f}s[/bold green]")
     logger.info(
-        "Run #%s complete | Assets: %d | Tweets: %d | Articles: %d | Top asset: %s (%.1f)",
+        "Run #%s complete | Assets: %d | Tweets: %d | Articles: %d | "
+        "GDELT: %d | Polymarket: %d | Disasters: %d | ACLED: %d | Top: %s (%.1f)",
         RUN_NUMBER, len(assets), len(tweets), len(articles),
+        len(gdelt_events), len(prediction_events), len(disaster_events), len(acled_events),
         top10[0]["symbol"] if top10 else "N/A",
         top10[0]["final_score"] if top10 else 0,
     )

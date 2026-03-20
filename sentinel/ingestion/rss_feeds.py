@@ -12,16 +12,46 @@ from typing import Optional
 import httpx
 import feedparser
 
-from sentinel.config import RSS_FEEDS, SOURCE_TIERS, get_active_assets, get_match_keywords
+from sentinel.config import (
+    RSS_FEEDS, SOURCE_TIERS, get_active_assets, get_match_keywords,
+    REGULATORY_KEYWORDS, GEOPOLITICAL_KEYWORDS, EXCLUSION_KEYWORDS,
+)
 
 logger = logging.getLogger(__name__)
 
-# Keywords and cashtags to match articles to assets
-REGULATORY_KEYWORDS = [
-    "sec ", "regulation", "ban ", "approval", "etf filing", "cftc", "mica",
-    "stablecoin", "executive order", "enforcement action", "fine ", "settlement",
-    "esma", "compliance", "lawsuit",
-]
+
+def _is_excluded(text: str) -> bool:
+    """Check if text is likely entertainment/sports noise (false positive filter)."""
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in EXCLUSION_KEYWORDS)
+
+
+def _classify_regulatory(text: str) -> tuple[bool, str, float]:
+    """
+    Classifies text against tiered regulatory keywords.
+    Returns (is_regulatory, tier_name, severity_weight).
+    """
+    text_lower = text.lower()
+    for tier_name in ("critical", "high", "medium", "low"):
+        tier = REGULATORY_KEYWORDS.get(tier_name, {})
+        keywords = tier.get("keywords", [])
+        if any(kw in text_lower for kw in keywords):
+            return True, tier_name, tier.get("weight", 0.2)
+    return False, "none", 0.0
+
+
+def _classify_geopolitical(text: str) -> tuple[bool, str, float]:
+    """
+    Classifies text against tiered geopolitical threat keywords.
+    Returns (is_geopolitical, tier_name, severity_weight).
+    """
+    text_lower = text.lower()
+    for tier_name in ("critical", "high", "medium", "low"):
+        tier = GEOPOLITICAL_KEYWORDS.get(tier_name, {})
+        keywords = tier.get("keywords", [])
+        if any(kw in text_lower for kw in keywords):
+            return True, tier_name, tier.get("weight", 0.2)
+    return False, "none", 0.0
 
 
 def _parse_date(entry: feedparser.FeedParserDict) -> str:
@@ -83,17 +113,31 @@ async def _fetch_feed(
             continue
 
         text = f"{title} {summary}"
+
+        # Skip entertainment/sports false positives
+        if _is_excluded(text):
+            continue
+
         mentioned = _match_assets(text, active_assets)
 
+        # Tiered threat classification
+        is_reg, reg_tier, reg_weight = _classify_regulatory(text)
+        is_geo, geo_tier, geo_weight = _classify_geopolitical(text)
+
         articles.append({
-            "source":        source,
-            "source_tier":   tier,
-            "title":         title,
-            "summary":       summary[:1000],
-            "url":           link,
-            "asset_symbols": mentioned,
-            "published_at":  _parse_date(entry),
-            "_is_regulatory": any(kw in text.lower() for kw in REGULATORY_KEYWORDS),
+            "source":              source,
+            "source_tier":         tier,
+            "title":               title,
+            "summary":             summary[:1000],
+            "url":                 link,
+            "asset_symbols":       mentioned,
+            "published_at":        _parse_date(entry),
+            "_is_regulatory":      is_reg,
+            "_regulatory_tier":    reg_tier,
+            "_regulatory_weight":  reg_weight,
+            "_is_geopolitical":    is_geo,
+            "_geopolitical_tier":  geo_tier,
+            "_geopolitical_weight": geo_weight,
         })
 
     logger.info("  RSS %s: %d articles", source, len(articles))

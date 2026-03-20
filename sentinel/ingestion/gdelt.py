@@ -9,7 +9,12 @@ from datetime import datetime
 
 import httpx
 
+from sentinel.config import GEOPOLITICAL_KEYWORDS, EXCLUSION_KEYWORDS
+from sentinel.utils.resilience import CircuitBreaker
+
 logger = logging.getLogger(__name__)
+
+cb = CircuitBreaker(max_failures=3, cooldown_seconds=300)
 
 GDELT_DOC_API = "https://api.gdeltproject.org/api/v2/doc/doc"
 
@@ -58,7 +63,7 @@ async def _fetch_gdelt_query(client: httpx.AsyncClient, query: str) -> list[dict
 
     for attempt in range(3):
         try:
-            resp = await client.get(GDELT_DOC_API, params=params, timeout=20)
+            resp = await client.get(GDELT_DOC_API, params=params, timeout=45)
             resp.raise_for_status()
 
             # Validate response is actually JSON
@@ -78,8 +83,11 @@ async def _fetch_gdelt_query(client: httpx.AsyncClient, query: str) -> list[dict
             else:
                 logger.warning("  GDELT query error: HTTP %d", exc.response.status_code)
                 return []
+        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError) as exc:
+            logger.warning("  GDELT connection failed (%s): %s", type(exc).__name__, exc)
+            return []
         except Exception as exc:
-            logger.warning("  GDELT query error: %s", exc)
+            logger.warning("  GDELT query error (%s): %s", type(exc).__name__, exc)
             return []
 
     return []
@@ -90,29 +98,49 @@ async def fetch_gdelt_events() -> list[dict]:
     Fetches GDELT events from the last 12 hours matching conflict/macro themes.
     Splits into smaller queries to avoid rate limits.
     """
+    if not cb.is_available("gdelt"):
+        logger.warning("GDELT circuit breaker open -- skipping")
+        return []
+
     all_articles: list[dict] = []
 
     async with httpx.AsyncClient() as client:
         for query in QUERY_GROUPS:
             articles = await _fetch_gdelt_query(client, query)
-            all_articles.extend(articles)
-            # Pause between queries to avoid rate limiting
             if articles:
-                await asyncio.sleep(5)
+                all_articles.extend(articles)
+                cb.record_success("gdelt")
+            else:
+                cb.record_failure("gdelt")
+            # Pause between queries to avoid rate limiting
+            await asyncio.sleep(5)
 
     events: list[dict] = []
     for art in all_articles:
         tone = art.get("tone", 0)
         title = art.get("title", "")
         url = art.get("url", "")
+        title_lower = title.lower()
+
+        # Skip entertainment/sports false positives
+        if any(kw in title_lower for kw in EXCLUSION_KEYWORDS):
+            continue
 
         # Map to affected assets via keyword matching
         affected: list[str] = []
-        title_lower = title.lower()
-
         for keywords, assets in ASSET_KEYWORD_MAP:
             if any(kw in title_lower for kw in keywords):
                 affected.extend(assets)
+
+        # Classify geopolitical threat severity
+        threat_tier = "none"
+        threat_weight = 0.0
+        for tier_name in ("critical", "high", "medium", "low"):
+            tier = GEOPOLITICAL_KEYWORDS.get(tier_name, {})
+            if any(kw in title_lower for kw in tier.get("keywords", [])):
+                threat_tier = tier_name
+                threat_weight = tier.get("weight", 0.2)
+                break
 
         events.append({
             "event_code":        art.get("domain", ""),
@@ -125,6 +153,8 @@ async def fetch_gdelt_events() -> list[dict]:
             "affected_assets":   list(set(affected)),
             "event_date":        datetime.utcnow().date().isoformat(),
             "_url":              url,
+            "_threat_tier":      threat_tier,
+            "_threat_weight":    threat_weight,
         })
 
     logger.info("GDELT: %d events fetched (%d with asset mappings)",
@@ -135,6 +165,7 @@ async def fetch_gdelt_events() -> list[dict]:
 def compute_geopolitical_score(events: list[dict], symbol: str) -> float:
     """
     Aggregates GDELT events to produce a geopolitical signal score for one asset.
+    Now uses threat-tier weighting: critical events count 5x more than low events.
     Score range: -1.0 (very negative) to +1.0 (very positive).
     """
     if not events:
@@ -149,8 +180,23 @@ def compute_geopolitical_score(events: list[dict], symbol: str) -> float:
     safe_haven_assets = {"GLD", "SLV", "BTC"}
     is_safe_haven = symbol in safe_haven_assets
 
-    total_tone = sum(e["tone"] for e in relevant)
-    avg_tone = total_tone / len(relevant)
+    # Severity-weighted tone aggregation
+    weighted_tone = 0.0
+    total_weight = 0.0
+
+    for e in relevant:
+        tone = e.get("tone", 0.0)
+        # Use threat tier weight if available, else default 0.2
+        threat_weight = e.get("_threat_weight", 0.0)
+        event_weight = max(0.2, threat_weight)  # minimum weight for all events
+
+        weighted_tone += tone * event_weight
+        total_weight += event_weight
+
+    if total_weight == 0:
+        return 0.0
+
+    avg_tone = weighted_tone / total_weight
 
     if is_safe_haven:
         raw_signal = -avg_tone / 10.0

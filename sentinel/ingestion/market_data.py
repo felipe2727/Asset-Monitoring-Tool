@@ -15,7 +15,9 @@ import pandas as pd
 
 from sentinel.config import (
     get_active_assets, FINNHUB_API_KEY, ALPHA_VANTAGE_API_KEY, FRED_API_KEY,
+    EIA_API_KEY, EIA_API_BASE, EIA_SERIES, YAHOO_FINANCE_URL,
 )
+from sentinel.utils.resilience import CircuitBreaker, rate_limiters
 
 logger = logging.getLogger(__name__)
 
@@ -409,6 +411,159 @@ async def _fetch_coincap_data(assets) -> list[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# EIA Direct API (structured energy data — WTI, Brent, production, inventory)
+# ─────────────────────────────────────────────────────────────────────────────
+
+cb = CircuitBreaker(max_failures=3, cooldown_seconds=300)
+
+
+async def _fetch_eia_data(client: httpx.AsyncClient) -> dict[str, dict]:
+    """
+    Fetches EIA energy data: WTI/Brent prices, US production, US inventory.
+    Returns {symbol: {wti: float, brent: float, production: float, inventory: float, inventory_change: float}}.
+    """
+    if not EIA_API_KEY:
+        return {}
+    if not cb.is_available("eia"):
+        return {}
+
+    result: dict[str, dict] = {}
+
+    for series_id, meta in EIA_SERIES.items():
+        try:
+            await rate_limiters["eia"].acquire()
+            resp = await client.get(
+                f"{EIA_API_BASE}/{series_id}",
+                params={"api_key": EIA_API_KEY, "num": 2},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            observations = data.get("response", {}).get("data", [])
+
+            if not observations:
+                continue
+
+            current_val = float(observations[0].get("value", 0))
+            prev_val = float(observations[1].get("value", 0)) if len(observations) > 1 else current_val
+
+            symbol = meta["symbol"]
+            if symbol not in result:
+                result[symbol] = {}
+
+            data_type = meta.get("type", "price")
+            if data_type == "inventory":
+                result[symbol]["inventory"] = current_val
+                result[symbol]["inventory_change"] = current_val - prev_val
+                logger.info("  EIA %s (inventory): %.1f (change: %+.1f)", series_id, current_val, current_val - prev_val)
+            elif data_type == "production":
+                result[symbol]["production"] = current_val
+                logger.info("  EIA %s (production): %.1f", series_id, current_val)
+            else:
+                # Price data
+                name_lower = meta["name"].lower()
+                if "brent" in name_lower:
+                    result[symbol]["brent"] = current_val
+                    logger.info("  EIA Brent: $%.2f", current_val)
+                else:
+                    result[symbol]["wti"] = current_val
+                    logger.info("  EIA WTI: $%.2f", current_val)
+
+            cb.record_success("eia")
+
+        except Exception as exc:
+            logger.warning("  EIA %s: %s", series_id, exc)
+            cb.record_failure("eia")
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Yahoo Finance (fallback for Finnhub + Alpha Vantage)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _fetch_yahoo_finance(symbols: list[str]) -> list[dict]:
+    """
+    Fallback: fetches market data from Yahoo Finance when Finnhub/AV fail.
+    Returns list of market data dicts in the same schema as _fetch_finnhub_data.
+    """
+    if not cb.is_available("yahoo"):
+        return []
+
+    today_str = date.today().isoformat()
+    results = []
+
+    async with httpx.AsyncClient() as client:
+        for symbol in symbols:
+            try:
+                await rate_limiters["yahoo"].acquire()
+                url = f"{YAHOO_FINANCE_URL}/{symbol}"
+                resp = await client.get(
+                    url,
+                    params={"interval": "1d", "range": "3mo"},
+                    headers={"User-Agent": "Mozilla/5.0 (Sentinel/1.0)"},
+                    timeout=15,
+                )
+                if not resp.is_success:
+                    logger.warning("  Yahoo %s: HTTP %d", symbol, resp.status_code)
+                    cb.record_failure("yahoo")
+                    continue
+
+                data = resp.json()
+                chart = data.get("chart", {}).get("result", [])
+                if not chart:
+                    continue
+
+                result = chart[0]
+                meta = result.get("meta", {})
+                indicators = result.get("indicators", {})
+                quotes = indicators.get("quote", [{}])[0]
+
+                closes_raw = quotes.get("close", [])
+                volumes_raw = quotes.get("volume", [])
+
+                # Filter None values
+                closes_clean = [c for c in closes_raw if c is not None]
+                volumes_clean = [v for v in volumes_raw if v is not None]
+
+                if not closes_clean:
+                    continue
+
+                closes = pd.Series(closes_clean)
+                volumes = pd.Series(volumes_clean) if volumes_clean else pd.Series([0])
+
+                current = closes.iloc[-1]
+                last_vol = int(volumes.iloc[-1]) if len(volumes) > 0 else 0
+                avg_vol = float(volumes.tail(20).mean()) if len(volumes) >= 20 else float(volumes.mean())
+
+                results.append({
+                    "symbol":             symbol,
+                    "date":               today_str,
+                    "open":               meta.get("previousClose"),
+                    "high":               float(max(closes_raw[-5:])) if len(closes_raw) >= 5 else None,
+                    "low":                float(min(c for c in closes_raw[-5:] if c)) if len(closes_raw) >= 5 else None,
+                    "close":              float(current),
+                    "volume":             last_vol,
+                    "market_cap":         None,
+                    "rsi_14":             _compute_rsi(closes),
+                    "macd_signal":        _compute_macd_signal(closes),
+                    "bollinger_position": _compute_bollinger_position(closes),
+                    "volatility_30d":     _compute_volatility_30d(closes),
+                    "avg_volume_20d":     avg_vol,
+                    "volume_zscore":      _compute_volume_zscore(volumes),
+                    "_source":            "yahoo",
+                })
+                logger.debug("  Yahoo %s: close=%.2f", symbol, float(current))
+                cb.record_success("yahoo")
+
+            except Exception as exc:
+                logger.warning("  Yahoo %s: %s", symbol, exc)
+                cb.record_failure("yahoo")
+
+    return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -425,10 +580,19 @@ async def fetch_market_data() -> dict[str, dict]:
     # Fetch stocks/ETFs via Finnhub + Alpha Vantage
     stock_rows = await _fetch_finnhub_data(stock_symbols)
 
+    # Yahoo Finance fallback: if Finnhub/AV returned < 50% of expected, fill gaps
+    covered_symbols = {r["symbol"] for r in stock_rows}
+    missing_symbols = [s for s in stock_symbols if s not in covered_symbols]
+    yahoo_rows: list[dict] = []
+    if missing_symbols:
+        logger.info("  %d stock symbols missing from Finnhub/AV — trying Yahoo Finance", len(missing_symbols))
+        yahoo_rows = await _fetch_yahoo_finance(missing_symbols)
+        stock_rows.extend(yahoo_rows)
+
     # Fetch crypto: CoinGecko primary, CoinCap fallback
     crypto_rows = await _fetch_coingecko_data(crypto_assets)
     if not crypto_rows:
-        logger.warning("CoinGecko returned no data — falling back to CoinCap")
+        logger.warning("CoinGecko returned no data -- falling back to CoinCap")
         crypto_rows = await _fetch_coincap_data(crypto_assets)
 
     all_rows = stock_rows + crypto_rows
@@ -437,15 +601,26 @@ async def fetch_market_data() -> dict[str, dict]:
     # Enrich commodity ETFs with FRED spot prices
     async with httpx.AsyncClient() as client:
         fred_spots = await _fetch_fred_spot_prices(client)
+
+        # Also fetch EIA energy data (WTI, Brent, production, inventory)
+        eia_data = await _fetch_eia_data(client)
+
     for symbol, spot_price in fred_spots.items():
         if symbol in by_symbol:
             by_symbol[symbol]["_spot_price"] = spot_price
         else:
-            logger.debug("  FRED spot for %s but no market row — skipping", symbol)
+            logger.debug("  FRED spot for %s but no market row -- skipping", symbol)
+
+    # Merge EIA data into market rows
+    for symbol, eia_info in eia_data.items():
+        if symbol in by_symbol:
+            by_symbol[symbol]["_eia"] = eia_info
+        else:
+            logger.debug("  EIA data for %s but no market row -- skipping", symbol)
 
     logger.info(
-        "Market data: %d stocks/ETFs, %d crypto, %d FRED spots (%d total)",
-        len(stock_rows), len(crypto_rows), len(fred_spots), len(all_rows),
+        "Market data: %d stocks/ETFs (%d via Yahoo), %d crypto, %d FRED spots, %d EIA series (%d total)",
+        len(stock_rows), len(yahoo_rows), len(crypto_rows), len(fred_spots), len(eia_data), len(all_rows),
     )
     return by_symbol
 

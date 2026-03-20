@@ -88,11 +88,15 @@ def _check_investability(signal_row: dict, market_row: Optional[dict]) -> float:
 
 def _compute_confidence(signal_row: dict, articles: list[dict], symbol: str) -> float:
     """
-    Confidence = source_breadth × source_quality × freshness
+    Confidence = source_breadth × source_quality × freshness × data_depth
+
+    data_depth rewards assets that have signal contributions from multiple
+    independent data categories (articles, GDELT, ACLED, prediction markets,
+    disasters, EIA) — not just news articles.
     """
     relevant_articles = [a for a in articles if symbol in a.get("asset_symbols", [])]
 
-    # Source breadth: how many independent sources
+    # Source breadth: how many independent news sources
     sources = set(a.get("source", "") for a in relevant_articles)
     breadth = min(1.0, len(sources) / 5.0)   # 5+ independent sources = max
 
@@ -105,7 +109,20 @@ def _compute_confidence(signal_row: dict, articles: list[dict], symbol: str) -> 
     # Freshness: based on catalyst_freshness signal
     freshness = signal_row.get("catalyst_freshness", 0.3)
 
-    confidence = 0.4 * breadth + 0.35 * quality + 0.25 * freshness
+    # Data depth: count how many of the 11 signals are non-zero.
+    # More active signals = more data categories contributed = higher confidence.
+    active_signals = sum(
+        1 for k in SIGNAL_KEYS
+        if abs(signal_row.get(k, 0.0)) > 0.001
+    )
+    data_depth = min(1.0, active_signals / 8.0)  # 8+ active signals = max
+
+    confidence = (
+        0.30 * breadth +
+        0.30 * quality +
+        0.20 * freshness +
+        0.20 * data_depth
+    )
     return float(np.clip(confidence, 0.1, 1.0))
 
 

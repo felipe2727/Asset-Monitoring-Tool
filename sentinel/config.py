@@ -67,6 +67,13 @@ REDDIT_CLIENT_ID: str = os.getenv("REDDIT_CLIENT_ID", "")
 REDDIT_CLIENT_SECRET: str = os.getenv("REDDIT_CLIENT_SECRET", "")
 REDDIT_USER_AGENT: str = os.getenv("REDDIT_USER_AGENT", "Sentinel/1.0")
 
+# New API keys (Phase 1-3 enhancements)
+EIA_API_KEY: str = os.getenv("EIA_API_KEY", "")
+ACLED_EMAIL: str = os.getenv("ACLED_EMAIL", "")
+ACLED_PASSWORD: str = os.getenv("ACLED_PASSWORD", "")
+NASA_FIRMS_API_KEY: str = os.getenv("NASA_FIRMS_API_KEY", "")
+CLOUDFLARE_RADAR_TOKEN: str = os.getenv("CLOUDFLARE_RADAR_TOKEN", "")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Scraper endpoint URLs
 # ─────────────────────────────────────────────────────────────────────────────
@@ -80,6 +87,25 @@ STOCKTWITS_SYMBOL_MAP: dict[str, str] = {
     "ARB": "ARB.X", "OP": "OP.X", "NEAR": "NEAR.X",
     "SUI": "SUI.X", "INJ": "INJ.X", "RENDER": "RNDR.X",
     "FET": "FET.X", "APT": "APT.X",
+}
+
+# New data source URLs (WorldMonitor audit enhancements)
+POLYMARKET_API: str = "https://gamma-api.polymarket.com/events"
+KALSHI_API: str = "https://api.elections.kalshi.com/trade-api/v2/events"
+USGS_EARTHQUAKE_URL: str = "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_day.geojson"
+EIA_API_BASE: str = "https://api.eia.gov/v2/seriesid"
+ACLED_TOKEN_URL: str = "https://acleddata.com/oauth/token"
+ACLED_API_URL: str = "https://acleddata.com/api/acled/read"
+NASA_FIRMS_URL: str = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
+CLOUDFLARE_RADAR_URL: str = "https://api.cloudflare.com/client/v4/radar/annotations/outages"
+YAHOO_FINANCE_URL: str = "https://query1.finance.yahoo.com/v8/finance/chart"
+
+# EIA series IDs for energy data
+EIA_SERIES: dict[str, dict] = {
+    "PET.RWTC.W":     {"symbol": "USO", "name": "WTI Crude Oil spot (weekly)"},
+    "PET.RBRTE.W":    {"symbol": "USO", "name": "Brent Crude Oil spot (weekly)"},
+    "PET.WCRFPUS2.W": {"symbol": "USO", "name": "US Crude Production (weekly)", "type": "production"},
+    "PET.WCESTUS1.W": {"symbol": "USO", "name": "US Crude Inventory (weekly)", "type": "inventory"},
 }
 ALPHA_VANTAGE_API_KEY: str = os.getenv("ALPHA_VANTAGE_API_KEY", "")
 FRED_API_KEY: str = os.getenv("FRED_API_KEY", "")
@@ -99,18 +125,18 @@ SENTIMENT_BATCH_SIZE: int = 20  # items per OpenAI call
 # Signal base weights (must sum to 1.0)
 # ─────────────────────────────────────────────────────────────────────────────
 BASE_WEIGHTS: dict[str, float] = {
-    "news_sentiment":          0.12,
-    "social_sentiment":        0.10,
-    "sentiment_shift":         0.08,
-    "volume_anomaly":          0.12,
-    "momentum_score":          0.12,
-    "correlation_divergence":  0.08,
-    "risk_adjusted_liquidity": 0.10,
-    "regulatory_signal":       0.08,
-    "competitor_edge":         0.06,
-    "geopolitical_flow":       0.07,
-    "catalyst_freshness":      0.07,
-}
+    "news_sentiment":          0.11,   # 26 RSS feeds incl. wire services
+    "social_sentiment":        0.09,   # Twitter + Reddit 3-tier cascades
+    "sentiment_shift":         0.07,   # derivative of above two
+    "volume_anomaly":          0.12,   # Finnhub + EIA inventory/production for energy
+    "momentum_score":          0.11,   # RSI/MACD/BB from AV + Yahoo fallback
+    "correlation_divergence":  0.07,   # needs 30d+ history, bootstrap penalty
+    "risk_adjusted_liquidity": 0.09,   # vol, illiquidity, drawdown, small-cap
+    "regulatory_signal":       0.10,   # 32 tiered keywords + Polymarket regulatory markets
+    "competitor_edge":         0.05,   # peer-relative, narrower scope
+    "geopolitical_flow":       0.12,   # GDELT + ACLED + Polymarket + USGS + FIRMS + Cloudflare
+    "catalyst_freshness":      0.07,   # recency × source tier × uniqueness
+}  # sum = 1.00
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Source tier weights (for news quality scoring)
@@ -119,12 +145,18 @@ SOURCE_TIERS: dict[str, float] = {
     "ft.com":            1.0,
     "bloomberg.com":     1.0,
     "reuters.com":       1.0,
+    "reutersagency.com": 1.0,
+    "apnews.com":        1.0,
     "wsj.com":           0.9,
     "cnbc.com":          0.8,
     "marketwatch.com":   0.8,
+    "bbc.co.uk":         0.8,
+    "npr.org":           0.7,
+    "theguardian.com":   0.7,
     "coindesk.com":      0.7,
     "theblock.co":       0.7,
     "decrypt.co":        0.7,
+    "cointelegraph.com": 0.6,
     "seekingalpha.com":  0.5,
     "zerohedge.com":     0.4,
     "finnhub":           0.8,
@@ -133,10 +165,125 @@ SOURCE_TIERS: dict[str, float] = {
     "reddit":            0.3,
     "twitter":           0.2,
     "oilprice.com":      0.6,
-    "kitco.com":         0.7,
-    "mining.com":        0.6,
+    "google-news-metals": 0.6,
+    "investing.com":     0.6,
     "eia.gov":           0.8,
+    "aljazeera.com":     0.6,
+    "france24.com":      0.6,
+    "scmp.com":          0.6,
+    "nikkei.com":        0.7,
+    "spglobal.com":      0.8,
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tiered keyword taxonomy (WorldMonitor-inspired)
+# ─────────────────────────────────────────────────────────────────────────────
+
+GEOPOLITICAL_KEYWORDS: dict[str, dict] = {
+    "critical": {
+        "keywords": [
+            "declaration of war", "armed invasion", "military coup", "nuclear",
+            "economic collapse", "martial law", "government overthrown",
+        ],
+        "weight": 1.0,
+        "confidence": 0.9,
+    },
+    "high": {
+        "keywords": [
+            "military mobilization", "border conflict", "ceasefire broken",
+            "financial sanctions imposed", "currency crisis", "sovereign default",
+            "major cyberattack", "power grid attack", "embassy attack",
+            "mass casualty", "infrastructure attack",
+        ],
+        "weight": 0.7,
+        "confidence": 0.7,
+    },
+    "medium": {
+        "keywords": [
+            "trade sanctions", "diplomatic expulsion", "border closure",
+            "arms deal", "protest crackdown", "bank run", "credit downgrade",
+            "tariff increase", "supply chain disruption", "military exercise",
+        ],
+        "weight": 0.4,
+        "confidence": 0.5,
+    },
+    "low": {
+        "keywords": [
+            "diplomatic tension", "trade dispute", "defense spending",
+            "opposition protest", "price controls", "export restriction",
+            "military parade",
+        ],
+        "weight": 0.2,
+        "confidence": 0.3,
+    },
+}
+
+REGULATORY_KEYWORDS: dict[str, dict] = {
+    "critical": {
+        "keywords": [
+            "sec charges", "fraud charges", "criminal indictment",
+            "exchange delisted", "trading halted", "ponzi scheme",
+            "emergency ban", "asset seizure",
+        ],
+        "weight": 1.0,
+    },
+    "high": {
+        "keywords": [
+            "sec lawsuit", "enforcement action", "cease and desist",
+            "etf approved", "etf rejected", "fine imposed",
+            "regulatory crackdown", "subpoena issued", "settlement reached",
+        ],
+        "weight": 0.7,
+    },
+    "medium": {
+        "keywords": [
+            "regulation proposed", "etf filing", "compliance review",
+            "executive order", "stablecoin regulation", "mica",
+            "cftc investigation", "esma guidance", "congressional hearing",
+        ],
+        "weight": 0.4,
+    },
+    "low": {
+        "keywords": [
+            "regulatory update", "compliance", "policy review",
+            "comment period", "public consultation", "draft legislation",
+        ],
+        "weight": 0.2,
+    },
+}
+
+EXCLUSION_KEYWORDS: list[str] = [
+    "celebrity", "entertainment", "sports", "box office", "album release",
+    "movie review", "fashion", "dating", "relationship", "gossip",
+    "concert", "reality tv", "award show", "red carpet",
+]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Geo-proximity zones for disaster -> asset mapping
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Each zone: (lat, lon, radius_km, affected_assets)
+PRODUCTION_ZONES: list[tuple[float, float, float, list[str]]] = [
+    # Copper: Chile, Peru, DRC, Zambia
+    (-23.5, -70.5, 800, ["CPER"]),        # Northern Chile (Antofagasta)
+    (-15.0, -75.0, 600, ["CPER"]),        # Southern Peru
+    (-5.0,  27.0,  500, ["CPER"]),        # DRC copper belt
+    # Gold: South Africa, Australia, Nevada
+    (-26.0, 28.0,  400, ["GLD", "SLV"]),  # Witwatersrand, SA
+    (-31.0, 121.0, 600, ["GLD"]),         # Western Australia
+    (40.8, -117.0, 300, ["GLD", "SLV"]),  # Nevada
+    # Oil/Gas: Middle East, Gulf of Mexico, North Sea
+    (26.0,  50.0,  800, ["USO", "UNG"]),  # Persian Gulf
+    (28.0, -90.0,  500, ["USO", "UNG"]),  # Gulf of Mexico
+    (58.0,   2.0,  400, ["USO", "UNG"]),  # North Sea
+    (62.0,  70.0,  600, ["USO", "UNG"]),  # Western Siberia
+    # Semiconductors: Taiwan, South Korea
+    (24.0, 121.0,  200, ["NVDA", "AMD", "AVGO"]),  # Taiwan (TSMC)
+    (37.0, 127.0,  200, ["NVDA", "AMD"]),           # South Korea (Samsung)
+    # Real estate: California, Tokyo
+    (36.0, -119.0, 400, ["VNQ"]),         # California
+    (35.7, 139.7,  200, ["VNQ"]),         # Tokyo
+]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Asset watchlist
@@ -264,25 +411,39 @@ def get_active_assets() -> list[Asset]:
 # RSS feed list
 # ─────────────────────────────────────────────────────────────────────────────
 RSS_FEEDS: list[dict] = [
-    # Tier 1 — Major financial news
+    # ── Tier 1 — Wire services (highest quality) ─────────────────────────────
+    {"url": "https://www.reutersagency.com/feed/?taxonomy=best-sectors&post_type=best", "source": "reutersagency.com", "tier": 1.0},
+    {"url": "https://rsshub.app/apnews/topics/business",               "source": "apnews.com",      "tier": 1.0},
+    {"url": "https://feeds.bloomberg.com/markets/news.rss",            "source": "bloomberg.com",   "tier": 1.0},
+    # ── Tier 1 — Major financial ─────────────────────────────────────────────
     {"url": "https://news.google.com/rss/topics/CAAqJggKIiBDQkFTRWdvSUwyMHZNRGx6TVdZU0FtVnVHZ0pWVXlnQVAB", "source": "google-news-business", "tier": 0.8},
-    {"url": "https://www.cnbc.com/id/100003114/device/rss/rss.html",  "source": "cnbc.com",       "tier": 0.8},
-    {"url": "https://feeds.marketwatch.com/marketwatch/topstories",   "source": "marketwatch.com","tier": 0.8},
+    {"url": "https://www.cnbc.com/id/100003114/device/rss/rss.html",   "source": "cnbc.com",        "tier": 0.8},
+    {"url": "https://feeds.marketwatch.com/marketwatch/topstories",    "source": "marketwatch.com", "tier": 0.8},
     {"url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839135", "source": "cnbc.com", "tier": 0.8},
-    # Tier 2 — Crypto
-    {"url": "https://www.coindesk.com/arc/outboundfeeds/rss/",        "source": "coindesk.com",   "tier": 0.7},
-    {"url": "https://decrypt.co/feed",                                 "source": "decrypt.co",     "tier": 0.7},
-    # Tier 3 — Analysis
-    {"url": "https://seekingalpha.com/market_currents.xml",           "source": "seekingalpha.com","tier": 0.5},
-    # Tier 4 — Regulatory
+    {"url": "https://feeds.bbci.co.uk/news/business/rss.xml",         "source": "bbc.co.uk",       "tier": 0.8},
+    {"url": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",          "source": "wsj.com",         "tier": 0.9},
+    {"url": "https://feeds.npr.org/1006/rss.xml",                     "source": "npr.org",         "tier": 0.7},
+    {"url": "https://www.theguardian.com/uk/business/rss",             "source": "theguardian.com", "tier": 0.7},
+    # ── Tier 2 — Crypto / DeFi ──────────────────────────────────────────────
+    {"url": "https://www.coindesk.com/arc/outboundfeeds/rss/",         "source": "coindesk.com",    "tier": 0.7},
+    {"url": "https://decrypt.co/feed",                                  "source": "decrypt.co",      "tier": 0.7},
+    {"url": "https://www.theblock.co/rss/all",                         "source": "theblock.co",     "tier": 0.7},
+    {"url": "https://cointelegraph.com/rss",                           "source": "cointelegraph.com", "tier": 0.6},
+    # ── Tier 2 — Geopolitical (new category) ─────────────────────────────────
+    {"url": "https://www.aljazeera.com/xml/rss/all.xml",               "source": "aljazeera.com",   "tier": 0.6},
+    {"url": "https://www.france24.com/en/rss",                         "source": "france24.com",    "tier": 0.6},
+    {"url": "https://www.scmp.com/rss/4/feed",                        "source": "scmp.com",        "tier": 0.6},
+    # ── Tier 3 — Analysis ────────────────────────────────────────────────────
+    {"url": "https://seekingalpha.com/market_currents.xml",            "source": "seekingalpha.com", "tier": 0.5},
+    # ── Tier 4 — Regulatory ──────────────────────────────────────────────────
     {"url": "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=&dateb=&owner=include&count=40&output=atom", "source": "sec.gov", "tier": 0.9},
-    {"url": "https://www.cftc.gov/PressRoom/PressReleases/rss.xml",    "source": "cftc.gov",       "tier": 0.9},
-    # Tier 2 — Commodities / Energy / Metals
-    {"url": "https://oilprice.com/rss/main",                            "source": "oilprice.com",    "tier": 0.7},
-    {"url": "https://www.kitco.com/news/category/mining/rss",           "source": "kitco.com",       "tier": 0.7},
-    {"url": "https://mining.com/tag/gold/feed/",                        "source": "mining.com",      "tier": 0.6},
-    {"url": "https://mining.com/tag/copper/feed/",                      "source": "mining.com",      "tier": 0.6},
-    {"url": "https://www.eia.gov/rss/todayinenergy.xml",                "source": "eia.gov",         "tier": 0.8},
+    {"url": "https://www.cftc.gov/PressRoom/PressReleases/rss.xml",   "source": "cftc.gov",        "tier": 0.9},
+    # ── Tier 2 — Commodities / Energy / Metals ───────────────────────────────
+    {"url": "https://oilprice.com/rss/main",                           "source": "oilprice.com",    "tier": 0.7},
+    {"url": "https://news.google.com/rss/search?q=gold+silver+copper+metals+mining&hl=en-US&gl=US&ceid=US:en", "source": "google-news-metals", "tier": 0.6},
+    {"url": "https://www.investing.com/rss/commodities.rss",           "source": "investing.com",   "tier": 0.6},
+    {"url": "https://www.eia.gov/rss/todayinenergy.xml",               "source": "eia.gov",         "tier": 0.8},
+    {"url": "https://www.spglobal.com/commodityinsights/en/rss-feed",  "source": "spglobal.com",    "tier": 0.8},
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
