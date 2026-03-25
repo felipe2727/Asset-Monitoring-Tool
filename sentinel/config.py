@@ -464,10 +464,21 @@ MIN_MARKET_CAP_CRYPTO: float = 50e6    # $50M
 MIN_DATA_SOURCES: int = 3
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Paths
+# Paths — Volume-aware for Modal, local fallback for dev
 # ─────────────────────────────────────────────────────────────────────────────
 import pathlib
 ROOT_DIR = pathlib.Path(__file__).parent.parent
-DB_PATH  = ROOT_DIR / "sentinel.db"
-LOGS_DIR = ROOT_DIR / "logs"
-LOGS_DIR.mkdir(exist_ok=True)
+
+_modal_data_env = os.getenv("MODAL_DATA_DIR", "")
+if _modal_data_env and pathlib.Path(_modal_data_env).is_dir():
+    _MODAL_DATA = pathlib.Path(_modal_data_env)
+    DB_PATH   = _MODAL_DATA / "sentinel.db"
+    LOGS_DIR  = _MODAL_DATA / "logs"
+    CACHE_DIR = _MODAL_DATA / "cache"
+else:
+    DB_PATH   = ROOT_DIR / "sentinel.db"
+    LOGS_DIR  = ROOT_DIR / "logs"
+    CACHE_DIR = ROOT_DIR / "data"
+
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True)

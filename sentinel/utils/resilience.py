@@ -125,4 +125,5 @@ rate_limiters: dict[str, RateLimiter] = {
     "usgs":           RateLimiter(0.0),    # static file, no limit
     "nasa_firms":     RateLimiter(1.0),    # conservative
     "cloudflare":     RateLimiter(1.0),    # conservative
+    "gdelt":          RateLimiter(2.0),    # free API, soft-limits ~1 req/s
 }

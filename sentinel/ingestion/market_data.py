@@ -655,4 +655,29 @@ async def fetch_macro_context() -> dict:
     except Exception:
         pass
 
+    # VIX + 10Y Yield via Yahoo Finance
+    for yf_symbol, macro_key in [("^VIX", "^VIX"), ("^TNX", "^TNX")]:
+        try:
+            async with httpx.AsyncClient() as client:
+                await rate_limiters["yahoo"].acquire()
+                resp = await client.get(
+                    f"{YAHOO_FINANCE_URL}/{yf_symbol}",
+                    params={"interval": "1d", "range": "1d"},
+                    headers={"User-Agent": "Mozilla/5.0 (Sentinel/1.0)"},
+                    timeout=15,
+                )
+                if resp.is_success:
+                    chart = resp.json().get("chart", {}).get("result", [])
+                    if chart:
+                        price = chart[0].get("meta", {}).get("regularMarketPrice")
+                        if price is None:
+                            closes = chart[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
+                            closes = [c for c in closes if c is not None]
+                            if closes:
+                                price = closes[-1]
+                        if price is not None:
+                            macro[macro_key] = float(price)
+        except Exception as exc:
+            logger.warning("Macro %s fetch error: %s", yf_symbol, exc)
+
     return macro

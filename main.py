@@ -38,6 +38,8 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.progress import Progress, SpinnerColumn, TextColumn
 
+from sentinel.config import LOGS_DIR
+
 # --- Setup logging -----------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -45,7 +47,7 @@ logging.basicConfig(
     handlers=[
         RichHandler(rich_tracebacks=True, show_path=False),
         logging.FileHandler(
-            Path(__file__).parent / "logs" / f"sentinel_{date.today().isoformat()}.log",
+            LOGS_DIR / f"sentinel_{date.today().isoformat()}.log",
             encoding="utf-8",
         ),
     ],

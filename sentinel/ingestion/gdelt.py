@@ -3,14 +3,16 @@ GDELT 2.0 geopolitical event fetcher.
 Free, no API key required, updates every 15 minutes.
 """
 import asyncio
+import json
 import logging
 import random
 from datetime import datetime
+from pathlib import Path
 
 import httpx
 
-from sentinel.config import GEOPOLITICAL_KEYWORDS, EXCLUSION_KEYWORDS
-from sentinel.utils.resilience import CircuitBreaker
+from sentinel.config import GEOPOLITICAL_KEYWORDS, EXCLUSION_KEYWORDS, CACHE_DIR
+from sentinel.utils.resilience import CircuitBreaker, rate_limiters
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +51,29 @@ ASSET_KEYWORD_MAP = [
     (["real estate", "housing", "mortgage", "interest rate", "fed rate"],     ["VNQ", "O"]),
 ]
 
+# ── File cache for resilience ────────────────────────────────────────────────
+_GDELT_CACHE = CACHE_DIR / "gdelt_cache.json"
+
+
+def _save_cache(events: list[dict]) -> None:
+    try:
+        _GDELT_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        _GDELT_CACHE.write_text(json.dumps(events, default=str))
+    except Exception as exc:
+        logger.debug("GDELT cache write failed: %s", exc)
+
+
+def _load_cache() -> list[dict]:
+    try:
+        if _GDELT_CACHE.exists():
+            age_min = (datetime.utcnow().timestamp() - _GDELT_CACHE.stat().st_mtime) / 60
+            events = json.loads(_GDELT_CACHE.read_text())
+            logger.info("GDELT: using cached data (%d events, %.0f min old)", len(events), age_min)
+            return events
+    except Exception as exc:
+        logger.debug("GDELT cache read failed: %s", exc)
+    return []
+
 
 async def _fetch_gdelt_query(client: httpx.AsyncClient, query: str) -> list[dict]:
     """Fetches one GDELT query with exponential backoff."""
@@ -63,6 +88,7 @@ async def _fetch_gdelt_query(client: httpx.AsyncClient, query: str) -> list[dict
 
     for attempt in range(3):
         try:
+            await rate_limiters["gdelt"].acquire()
             resp = await client.get(GDELT_DOC_API, params=params, timeout=45)
             resp.raise_for_status()
 
@@ -77,7 +103,7 @@ async def _fetch_gdelt_query(client: httpx.AsyncClient, query: str) -> list[dict
 
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 429 and attempt < 2:
-                wait = min(120, 30 * (2 ** attempt) + random.uniform(0, 10))
+                wait = min(180, 45 * (2 ** attempt) + random.uniform(5, 20))
                 logger.info("  GDELT rate-limited, waiting %.0fs (attempt %d/3)...", wait, attempt + 1)
                 await asyncio.sleep(wait)
             else:
@@ -113,7 +139,7 @@ async def fetch_gdelt_events() -> list[dict]:
             else:
                 cb.record_failure("gdelt")
             # Pause between queries to avoid rate limiting
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
 
     events: list[dict] = []
     for art in all_articles:
@@ -156,6 +182,11 @@ async def fetch_gdelt_events() -> list[dict]:
             "_threat_tier":      threat_tier,
             "_threat_weight":    threat_weight,
         })
+
+    if events:
+        _save_cache(events)
+    elif not events:
+        events = _load_cache()
 
     logger.info("GDELT: %d events fetched (%d with asset mappings)",
                 len(events), sum(1 for e in events if e["affected_assets"]))
